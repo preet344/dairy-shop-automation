@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-import google.generativeai as genai
+from google import generativeai as genai
 import requests
 import json
 
@@ -14,14 +14,12 @@ st.set_page_config(
 
 # ---------------- GEMINI & N8N SETUP ----------------
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-
 gemini_model = genai.GenerativeModel(
     "gemini-1.5-pro-latest",
     generation_config={"response_mime_type": "application/json"},
 )
 
-N8N_WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]
-
+N8N_WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]  # your n8n webhook URL
 
 # ---------------- SIDEBAR ----------------
 with st.sidebar:
@@ -33,9 +31,7 @@ with st.sidebar:
     st.markdown("**Why this tool?**")
     st.markdown("- Detect near-expiry dairy items")
     st.markdown("- Highlight quantity / pricing issues")
-    st.markdown("- Auto-generate risk report")
-    st.markdown("- Auto email alerts using n8n")
-
+    st.markdown("- Trigger auto email alerts via n8n")
 
 # ---------------- SESSION STATE ----------------
 if "structured_json" not in st.session_state:
@@ -47,10 +43,8 @@ if "question" not in st.session_state:
 if "n8n_result" not in st.session_state:
     st.session_state.n8n_result = None
 
-
-# ---------------- MAIN UI ----------------
+# ---------------- MAIN LAYOUT ----------------
 st.title("Dairy Waste Orchestrator")
-
 col_center, col_right = st.columns([2, 1])
 
 uploaded_file = None
@@ -58,16 +52,15 @@ df = None
 risky_df = None
 risk_score = 0
 
-
 # ======================================================
-# INVENTORY + GEMINI + AUTO EMAIL
+# CENTER COLUMN: INVENTORY + GEMINI + N8N CONTROLS
 # ======================================================
 with col_center:
     tab_text, tab_structured = st.tabs(
         ["🥛 Inventory & Alerts", "📊 Gemini Structured JSON"]
     )
 
-    # ---------- TAB 1: UPLOAD & ANALYSE ----------
+    # ---------- TAB 1: Inventory ----------
     with tab_text:
         st.subheader("1. Upload Inventory & Analyse Expiry")
 
@@ -86,22 +79,25 @@ with col_center:
 
             total_items = len(df)
             risky_items = len(risky_df)
-
             if total_items > 0:
                 risk_ratio = risky_items / total_items
                 risk_score = int(max(0, 100 - risk_ratio * 100))
             else:
                 risk_score = 100
 
-            # TEXT PREVIEW
-            preview_lines = [
-                f"{row.product} - Qty: {row.quantity} - Expiry: {row.expiry_date.date()} - Days left: {row.days_left} - Price: ₹{row.price}"
-                for row in df.itertuples()
-            ]
+            # Text preview
+            lines = []
+            for row in df.itertuples():
+                line = (
+                    f"{row.product} - Qty: {row.quantity} - "
+                    f"Expiry: {row.expiry_date.date()} - "
+                    f"Days left: {row.days_left} - Price: ₹{row.price}"
+                )
+                lines.append(line)
 
             st.text_area(
                 "Inventory Text Preview",
-                "\n".join(preview_lines),
+                "\n".join(lines),
                 height=220,
             )
 
@@ -123,33 +119,36 @@ with col_center:
                 mime="text/csv",
             )
         else:
-            st.info("Upload an inventory CSV to start analysis.")
+            st.info("Upload an inventory CSV to start the analysis.")
 
-        # ---------- AUTO EMAIL TRIGGER ----------
-        if risky_df is not None and not risky_df.empty:
-
-            def send_auto_email_alert(risky_df, risk_score):
-                payload = {
-                    "risk_score": int(risk_score),
-                    "risky_items": risky_df.to_dict(orient="records"),
-                }
-
-                try:
-                    response = requests.post(N8N_WEBHOOK_URL, json=payload)
-                    return response.text
-                except Exception as e:
-                    return f"Error sending email: {e}"
-
-            auto_result = send_auto_email_alert(risky_df, risk_score)
-            st.success("🚨 Auto email alert triggered via n8n!")
-            st.text_area("n8n Auto Email Response", auto_result, height=150)
-
-        # ---------- GEMINI EXTRACTION ----------
+        # ---------- AUTO EMAIL ALERT (N8N) ----------
         st.markdown("---")
-        st.subheader("2. Ask a Question (Gemini Extraction)")
+        st.subheader("2. Auto Email Alerts (via n8n)")
+
+        def send_auto_email_alert(risky_df, risk_score):
+            payload = {
+                "risk_score": int(risk_score),
+                "risky_items": risky_df.to_dict(orient="records"),
+            }
+
+            try:
+                response = requests.post(N8N_WEBHOOK_URL, json=payload)
+                return response.text
+            except Exception as e:
+                return f"Error sending email: {e}"
+
+        # AUTOMATICALLY SEND EMAIL IF RISKY ITEMS EXIST
+        if uploaded_file and risky_df is not None and not risky_df.empty:
+            auto_result = send_auto_email_alert(risky_df, risk_score)
+            st.success("🚨 Auto email alert sent via n8n!")
+            st.text_area("n8n Response", auto_result, height=150)
+
+        # ---------- GEMINI STRUCTURED EXTRACTION ----------
+        st.markdown("---")
+        st.subheader("3. Ask a Question (Gemini Extraction)")
 
         question = st.text_input(
-            "Ask anything about this inventory (e.g., 'Which items are highest risk?')"
+            "Enter your question about this inventory (e.g., 'Which items are risky?')"
         )
         st.session_state.question = question
 
@@ -157,78 +156,46 @@ with col_center:
             "Run Gemini Structured Extraction",
             disabled=not (uploaded_file and question),
         ):
-            if not uploaded_file:
-                st.error("Upload an inventory CSV first.")
-            elif not question:
-                st.error("Enter a question.")
-            else:
-                extracted_text = "\n".join(
-                    f"{row.product} | qty={row.quantity} | expiry={row.expiry_date.date()} | days_left={row.days_left} | price={row.price}"
-                    for row in df.itertuples()
-                )
-                st.session_state.extracted_text = extracted_text
+            extracted_text = "\n".join(
+                f"{row.product} | qty={row.quantity} | expiry={row.expiry_date.date()} | days_left={row.days_left} | price={row.price}"
+                for row in df.itertuples()
+            )
+            st.session_state.extracted_text = extracted_text
 
-                json_schema = {
-                    "title": "Inventory QA extraction",
-                    "type": "object",
-                    "properties": {
-                        "key_fields": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "field_name": {"type": "string"},
-                                    "value": {"type": "string"},
-                                    "reason": {"type": "string"},
-                                },
+            json_schema = {
+                "title": "Inventory QA extraction",
+                "type": "object",
+                "properties": {
+                    "key_fields": {
+                        "type": "array",
+                        "description": "5–8 key value details.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field_name": {"type": "string"},
+                                "value": {"type": "string"},
+                                "reason": {"type": "string"},
                             },
                         },
-                        "summary": {"type": "string"},
-                        "risk_score": {"type": "integer"},
-                        "recommended_action": {"type": "string"},
                     },
-                    "required": ["key_fields", "summary", "risk_score"],
-                }
+                    "final_answer": {"type": "string"},
+                },
+                "required": ["key_fields", "final_answer"],
+            }
 
-                prompt = f"""
-You are an expert inventory auditor.
-Extract structured insights from this dairy inventory:
+            prompt = f"""
+            User Question: {question}
+            Inventory Data:
+            {extracted_text}
 
-Inventory:
-{extracted_text}
+            Follow this JSON schema strictly:
+            {json.dumps(json_schema)}
+            """
 
-Question:
-{question}
-
-Follow the JSON schema strictly.
-"""
-
-                response = gemini_model.generate_content(
-                    [prompt], generation_config={"response_schema": json_schema}
-                )
-
-                st.session_state.structured_json = response.text
+            response = gemini_model.generate_content(prompt)
+            st.session_state.structured_json = response.text
 
     # ---------- TAB 2: STRUCTURED JSON ----------
     with tab_structured:
-        st.subheader("Gemini Structured JSON Output")
-        if st.session_state.structured_json:
-            st.json(json.loads(st.session_state.structured_json))
-        else:
-            st.info("Run Gemini extraction to view structured output.")
-
-
-# ======================================================
-# RIGHT COLUMN – EXPIRY SNAPSHOT
-# ======================================================
-with col_right:
-    st.subheader("Expiry Snapshot")
-
-    st.metric("Risk Score", risk_score)
-
-    if risk_score <= 49:
-        st.error("High risk: Many items close to expiry")
-    elif risk_score <= 74:
-        st.warning("Needs attention")
-    else:
-        st.success("Excellent stock")
+        st.subheader("Gemini Structured Output")
+        st.json(st.session_state.structured_json)
