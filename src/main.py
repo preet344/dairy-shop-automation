@@ -1,116 +1,104 @@
 import streamlit as st
 import pandas as pd
+import sqlite3
 from datetime import datetime
 import google.generativeai as genai
-import requests
 
-# ---------------- CONFIG ----------------
-st.set_page_config(
-    page_title="Dairy Waste Orchestrator",
-    page_icon="🧀",
-    layout="wide",
-)
+# ========================
+# Gemini Configuration
+# ========================
+genai.configure(api_key="YOUR_GEMINI_API_KEY")
+gemini_model = genai.GenerativeModel("models/text-bison-001")  # Compatible with v1beta
 
-# --------- GOOGLE TEXT MODEL SETUP ----------
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+# ========================
+# Database Setup
+# ========================
+conn = sqlite3.connect("inventory.db", check_same_thread=False)
+c = conn.cursor()
+c.execute("""
+    CREATE TABLE IF NOT EXISTS inventory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product TEXT,
+        quantity INTEGER,
+        expiry_date TEXT,
+        price REAL
+    )
+""")
+conn.commit()
 
-# v1beta supported Text Model
-gemini_model = genai.GenerativeModel("models/text-bison-001")
+# ========================
+# Streamlit UI
+# ========================
+st.set_page_config(page_title="Dairy Inventory Management", layout="wide")
+st.title("🥛 Dairy Inventory & Expiry Tracking System")
 
-# ---------- N8N WEBHOOK ----------
-N8N_WEBHOOK_URL = st.secrets.get("N8N_WEBHOOK_URL", None)
+menu = st.sidebar.radio("Menu", ["Add Product", "View Inventory"])
 
-# ---------- UI HEADER ----------
-st.title("🧀 Dairy Waste Orchestrator – Smart Expiry Alerts")
+# ========================
+# Add Product Page
+# ========================
+if menu == "Add Product":
+    st.subheader("➕ Add New Product")
+    product = st.text_input("Product Name")
+    quantity = st.number_input("Quantity", min_value=1)
+    expiry_date = st.date_input("Expiry Date")
+    price = st.number_input("Price ₹", min_value=0.0)
 
-st.write("Upload your dairy inventory CSV to automatically detect high-risk expiry stock.")
-
-# ---------- FILE UPLOAD ----------
-uploaded_file = st.file_uploader(
-    "Upload Inventory CSV",
-    type=["csv"],
-    help="Must contain columns: product, quantity, expiry_date, price"
-)
-
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-
-    # Convert date column if needed
-    df["expiry_date"] = pd.to_datetime(df["expiry_date"])
-    df["days_remaining"] = (df["expiry_date"] - datetime.now()).dt.days
-
-    # Identify risk products
-    risky_df = df[df["days_remaining"] <= 3].copy()
-
-    # Risk Score
-    total_items = len(df)
-    risky_items = len(risky_df)
-    risk_score = int(max(0, 100 - (risky_items / total_items) * 100)) if total_items else 100
-
-    # Display risk level
-    st.subheader("📊 Risk Score")
-    st.metric("Calculated Score", f"{risk_score}")
-
-    st.subheader("🚨 Products expiring in ≤ 3 days")
-    if risky_df.empty:
-        st.success("🎉 No high-risk dairy products!")
-    else:
-        st.dataframe(risky_df, use_container_width=True)
-
-        st.download_button(
-            label="📥 Download High-Risk Report",
-            data=risky_df.to_csv(index=False),
-            file_name="high_risk_dairy_items.csv",
-            mime="text/csv"
+    if st.button("📌 Save Product"):
+        c.execute(
+            "INSERT INTO inventory (product, quantity, expiry_date, price) VALUES (?, ?, ?, ?)",
+            (product, quantity, expiry_date.strftime("%Y-%m-%d"), price),
         )
+        conn.commit()
+        st.success("Product saved successfully!")
 
-    st.markdown("---")
-    st.subheader("🤖 AI Suggested Action (Gemini)")
-    
-    if st.button("Generate AI Recommendation"):
-        inventory_text = "\n".join(
-            f"{row.product}, qty {row.quantity}, ₹{row.price}, expires in {row.days_remaining} days"
-            for row in df.itertuples()
-        )
+# ========================
+# View Inventory Page
+# ========================
+elif menu == "View Inventory":
+    st.subheader("📋 Current Inventory Status")
+    df = pd.read_sql_query("SELECT * FROM inventory", conn)
 
-        prompt = f"""
-        You are an inventory waste reduction expert.
-        Here is the stock list:\n{inventory_text}\n
-        Give a clear recommendation on which items to discount or sell fast.
-        Return 3–6 bullet points.
-        """
+    if not df.empty:
+        df["expiry_date"] = pd.to_datetime(df["expiry_date"])
+        df["days_remaining"] = (df["expiry_date"] - datetime.now()).dt.days
 
-        try:
-            response = gemini_model.generate_text(prompt=prompt)
-            st.write(response.result)
-        except Exception as e:
-            st.error(f"Gemini Error: {str(e)}")
+        st.dataframe(df)
 
-    st.markdown("---")
-    st.subheader("📧 Automatic Email Alert (via n8n)")
+        # 🔴 Highlight products expiring soon
+        st.warning("⚠ Items expiring in next 3 days:")
+        expiring = df[df["days_remaining"] <= 3]
 
-    if N8N_WEBHOOK_URL is None:
-        st.warning("⚠️ Add N8N_WEBHOOK_URL to Streamlit Secrets to enable email automation.")
-    else:
-        if st.button("Send Email Alert Now", type="primary", disabled=risky_df.empty):
-            payload = risky_df.to_dict(orient="records")
+        if not expiring.empty:
+            st.dataframe(expiring)
+
+        # ========================
+        # AI Recommendation (Gemini)
+        # ========================
+        st.subheader("🤖 AI Suggested Actions")
+        if st.button("Generate AI Recommendation"):
+
+            inventory_text = "\n".join(
+                f"{row.product}, qty {row.quantity}, ₹{row.price}, expires in {row.days_remaining} days"
+                for row in df.itertuples()
+            )
+
+            prompt = f"""
+            You are an expert in retail waste reduction. 
+            Here is current dairy stock:\n{inventory_text}
+
+            Provide 5 actionable steps to prevent inventory loss:
+            - Which items to discount?
+            - Which items to bundle/sell fast?
+            - Any suggestions for near expiry products?
+            """
+
             try:
-                res = requests.post(N8N_WEBHOOK_URL, json={"items": payload})
-                if res.status_code == 200:
-                    st.success("📩 Email Alert Sent Successfully!")
-                else:
-                    st.error(f"Webhook Error: {res.text}")
+                response = gemini_model.predict(prompt=prompt)
+                st.write(response.text)
             except Exception as e:
-                st.error(f"Error sending webhook: {str(e)}")
+                st.error(f"Gemini Error: {e}")
 
-else:
-    st.info("📌 Upload a CSV to begin risk analysis.")
+    else:
+        st.info("No items found. Add items from the sidebar.")
 
-# Sidebar Info
-with st.sidebar:
-    st.header("Risk Levels")
-    st.write("🟢 75–100 → Excellent")
-    st.write("🟡 50–74 → Attention Required")
-    st.write("🔴 0–49 → High Risk!")
-    st.markdown("---")
-    st.caption("Powered by Google AI + n8n automation")
